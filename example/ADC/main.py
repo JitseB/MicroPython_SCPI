@@ -2,8 +2,8 @@ from instr.ad1220 import ADC1220
 
 while True:
     try:
-        runner = ADC1220()
-        runner.run()
+        with ADC1220() as runner:
+            runner.run()
     except KeyboardInterrupt:
         break
     except Exception as e:

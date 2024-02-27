@@ -88,4 +88,5 @@ class LED(TestInstrument):
 
 
 if __name__ == "__main__":
-    runner = LED()
+    with LED() as runner:
+        runner.run()

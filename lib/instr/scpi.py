@@ -7,7 +7,7 @@ of the SCPI-99 standard.
 
 TestInstrument is a subclass of SCPI that adds some exit and debugging commands.
 """
-__all__ = ["Instrument", "SCPI", "TestInstrument"]
+__all__ = ["Instrument", "SCPIInstrument", "TestInstrument"]
 try:  # For micropython <=1.20
     import uasyncio as asyncio
 except ImportError:  # Desktop python or micropython>=1.21
@@ -17,29 +17,6 @@ from math import floor, log10
 
 from .decorators import BuildCommands, Command, prep_plist, tokenize
 from .exceptions import SCPIError, CommandError
-
-async def ainput(repl=None):
-    """Asynchornous input function.
-
-    Args:
-        repl (str, optional): Prompt for the input. Defaults to None.
-
-    Returns:
-        cmd (str): Input string recieved from stdin.
-
-    """
-    cmd = ""
-    reader = asyncio.StreamReader(sys.stdin)
-
-    while True:
-        if repl:
-            print(repl,end=None)
-        cmd = await reader.readline()
-        cmd = cmd.decode().strip()
-        if cmd != "":
-            break
-    return cmd
-
 
 class Instrument(object):
 
@@ -52,7 +29,7 @@ class Instrument(object):
 
     version = "0.0.1"
 
-    def __init__(self, debug=False):
+    def __init__(self, input_stream=sys.stdin, output_stream=sys.stdout, debug=False):
         """Initialise some instrument parameters, but do not start the main event loop"""
         self.current_node = None
         self.error_q = []
@@ -60,7 +37,38 @@ class Instrument(object):
         self.lock = asyncio.Lock()
         self.debug = debug
         self.stb = 0
+        self.input_stream = input_stream
+        self.output_stream = output_stream
+        self.writer = None
+        self.reader = None
+        if self.debug: print('SCPI debug: Instrument object created')
 
+    async def _ainput(self):
+        """Asynchronous input function.
+
+        Args:
+            stream (TextIO): IO stream to to use.
+
+        Returns:
+            cmd (str): Input string recieved from stream.
+
+        """
+        cmd = ""
+
+        while True:
+            cmd = await self.reader.readline()
+            cmd = cmd.decode().strip()
+            # Prevent warning. REPL expects stdin -> stdout.
+            if self.input_stream == sys.stdin: print(cmd)
+            if cmd != "":
+                break
+        return cmd
+
+    async def write(self, text):
+        if self.debug: print(f'SCPI debug (out): {text}')
+        self.writer.write((str(text) + '\n').encode())
+        await self.writer.drain()
+        
     def run(self):
         """Fire up the main event loop task for the instrument."""
         asyncio.run(self.read_commands())
@@ -75,13 +83,13 @@ class Instrument(object):
         """Find the command in the command table and get the correspoindig method name and parameter list.
 
         Args:
-            command (str): A complete command string wuith parameters.
+            command (str): A complete command string with parameters.
 
         Raises:
             CommandError: Raised when the parser can't match the command from either the current node or root..
 
         Returns:
-            str: The name of an executable attriobute (i.e. method) to run for this command.
+            str: The name of an executable attribute (i.e. method) to run for this command.
             plist (list of str): The command parameters a a list of strings, dealing with quotes and quoted commas.
         """
         while True:  # We potentially sscan the dictionary multiple times to locale a relative node
@@ -135,7 +143,10 @@ class Instrument(object):
         """
         try:  # Catch KeyBoard Interrupt
             while True:  # Main loop
-                cmd_String = await ainput()
+                if not self.writer or not self.reader:
+                    print('Streams were not initialized.')
+                cmd_String = await self._ainput()
+                if self.debug: print(f'SCPI debug (in): {cmd_String}')
                 for cmd in tokenize(cmd_String, ";"):  # Deal with multiple commands
                     try:
                         cmd_runner, plist = self.parse_cmd(cmd)
@@ -190,10 +201,21 @@ class Instrument(object):
         if mag in mag_letters:
             value = value / 10**mag
         return value, mag_letters.get(mag, "")
+    
+    def __enter__(self):
+        self.writer = asyncio.StreamWriter(self.output_stream, {})
+        self.reader = asyncio.StreamReader(self.input_stream, {})
+        if self.debug: print('SCPI debug: Instrument initialized')
+        return self
+
+    def __exit__(self):
+        self.writer.close()
+        self.reader.close()
+        if self.debug: print('SCPI debug: Instrument closed')
 
 
 @BuildCommands
-class SCPI(Instrument):
+class SCPIInstrument(Instrument):
 
     """Base class that defines the minimum necessary comands to be SCPI Compatible
 
@@ -292,7 +314,7 @@ class SCPI(Instrument):
         if self.service_enab & 32:
             self.stb |= 64
 
-    def __init__(self, debug=False):
+    def __init__(self, input_stream=sys.stdin, output_stream=sys.stdout, debug=False):
         """Initialise our registeres and other state."""
         self.stb = 0
         self._oper_reg = 0
@@ -305,7 +327,7 @@ class SCPI(Instrument):
         self.event_enab = 0
         self._event_event = 0
         self.service_enab = 0
-        super().__init__(debug)
+        super().__init__(input_stream, output_stream, debug)
 
     @Command(command="*CLS")
     def cls(self):
@@ -321,19 +343,19 @@ class SCPI(Instrument):
         self.event_enab = mask
 
     @Command(command="*ESE?")
-    def eseq(self):
+    async def eseq(self):
         """Report Standard Event Enable."""
-        print(self.event_enab)
+        await self.write(self.event_enab)
 
     @Command(command="*ESR?")
-    def esrq(self):
+    async def esrq(self):
         """Report Standard Event Register."""
-        print(self.event_reg)
+        await self.write(self.event_reg)
 
     @Command(command="*IDN?")
-    def idnq(self):
+    async def idnq(self):
         """Implements *IDN?"""
-        print(f"Raspberry Pico (MicroPython),{self.__class__.__name__},,{sys.version.split(' ')[2]}:{self.version}")
+        await self.write(f"Raspberry Pico (MicroPython),{self.__class__.__name__},{sys.version.split(' ')[2]}:{self.version}")
 
     @Command(command="*OPC")
     async def opc(self):
@@ -359,10 +381,10 @@ class SCPI(Instrument):
             else:
                 break
             await asyncio.sleep(0.1)
-        print(1)
+        await self.write(1)
 
     @Command(command="*RST")
-    def reset(self):
+    async def reset(self):
         """This needs to be overriden to actually do the reset."""
         for name, task in self.tasks:
             if not name.startswith("_"):  # Cancel non system tasks
@@ -376,22 +398,22 @@ class SCPI(Instrument):
         self.service_enab = mask
 
     @Command(command="*SRE?")
-    def sreq(self):
-        print(self.service_enab)
+    async def sreq(self):
+        await self.write(self.service_enab)
 
     @Command(command="*STB?")
-    def stbq(self):
+    async def stbq(self):
         """Implement a dummy *STB?"""
         if len(self.error_q):
             self.stb |= 4
         else:
             self.stb &= 251
-        print(self.stb)
+        await self.write(self.stb)
 
     @Command(command="*TST")
-    def self_test(self):
+    async def self_test(self):
         """Really a NOP !"""
-        print(0)
+        await self.write(0)
 
     @Command(command="*WAI", async_call=2)
     async def wait(self):
@@ -407,45 +429,45 @@ class SCPI(Instrument):
             await asyncio.sleep(0.1)
 
     @Command(command="SYSTem:ERRor[:NEXT]?")
-    def read_error_q(self):
+    async def read_error_q(self):
         """Pop the next error message of the queue and report it."""
         if len(self.error_q):
             err = self.error_q.pop()
         else:
             err = SCPIError
-        print(f"{err.code},{err.message}")
+        await self.write(f"{err.code},{err.message}")
 
     @Command(command="SYSTem:VERSion?")
-    def read_version(self):
-        print("1999.1")
+    async def read_version(self):
+        await self.write("1999.1")
 
     @Command(command="STATus:OPERation[:EVENt]?")
-    def scpi_oper_event(self):
-        print(self.oper_event)
+    async def scpi_oper_event(self):
+        await self.write(self.oper_event)
 
     @Command(command="STATus:OPERation:CONDition?")
-    def scpi_oper_reg(self):
-        print(self.oper_reg)
+    async def scpi_oper_reg(self):
+        await self.write(self.oper_reg)
 
     @Command(command="STATus:OPERation:ENABle?")
-    def scpi_oper_enabq(self):
-        print(self.oper_enab)
+    async def scpi_oper_enabq(self):
+        await self.write(self.oper_enab)
 
     @Command(command="STATus:OPERation:ENABle", parameters=(int,))
     def scpi_oper_enab(self, value):
         self.oper_enab = value
 
     @Command(command="STATus:QUEStionable[:EVENt]?")
-    def scpi_ques_event(self):
-        print(self.ques_event)
+    async def scpi_ques_event(self):
+        await self.write(self.ques_event)
 
     @Command(command="STATus:QUEStionable:CONDition?")
-    def scpi_ques_reg(self):
-        print(self.ques_reg)
+    async def scpi_ques_reg(self):
+        await self.write(self.ques_reg)
 
     @Command(command="STATus:QUEStionable:ENABle?")
-    def scpi_ques_enabq(self):
-        print(self.ques_enab)
+    async def scpi_ques_enabq(self):
+        await self.write(self.ques_enab)
 
     @Command(command="STATus:QUEStionable:ENABle", parameters=(int,))
     def scpi_ques_enab(self, value):
@@ -457,7 +479,7 @@ class SCPI(Instrument):
 
 
 @BuildCommands
-class TestInstrument(SCPI):
+class TestInstrument(SCPIInstrument):
 
     """Implement a set of test SCPI commands for debugging and testing.
 
@@ -471,27 +493,27 @@ class TestInstrument(SCPI):
     async def sleep(self, sleep_time):
         """Simply sleep for sleep_time seconds then print done."""
         if self.stb & 1:
-            print("Already sleeping!")
+            await self.write("Already sleeping!")
             return None
-        print("Sleepy time....")
+        await self.write("Sleepy time....")
         self.stb ^= 1
         await asyncio.sleep(sleep_time)
         self.stb ^= 1
-        print("Done")
+        await self.write("Done")
 
     @Command(command="SYSTem:EXIT")
     def exit_instrument(self):
         self.exit()
 
     @Command(command="SYSTem:PRINt", parameters=(str,))
-    def print(self, string):
+    async def print(self, string):
         """Test command to echo back the input."""
-        print(string)
+        await self.write(string)
 
     @Command(command="SYSTem:DEBUg?")
-    def debug_tasks(self):
+    async def debug_tasks(self):
         for name, task in self.tasks:
-            print(name, task.done())
+            await self.write(f'{name} {task.done()}')
 
 
 if __name__ == "__main__":
